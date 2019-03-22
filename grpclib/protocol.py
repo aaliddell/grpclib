@@ -1,10 +1,12 @@
 import socket
+import struct
+import asyncio
 
 from io import BytesIO
 from abc import ABC, abstractmethod
 from typing import Optional, List, Tuple, Dict  # noqa
 from asyncio import Transport, Protocol, Event, AbstractEventLoop
-from asyncio import Queue, QueueEmpty
+from asyncio import Queue, QueueEmpty, wait_for
 
 from h2.errors import ErrorCodes
 from h2.config import H2Configuration
@@ -190,6 +192,63 @@ class Connection:
 
     def close(self):
         self._transport.close()
+
+
+class HealthCheck:
+    _task = None
+    _interval = 10
+    _timeout = 10
+    _max_id = 2 ** 64 - 1
+
+    def __init__(self, connection: Connection):
+        self._connection = connection
+        self._h2_connection = connection._connection
+        self._loop = connection._loop
+        self._ping_id = 0
+        self._waiters = {}
+
+    async def _ping(self):
+        if not self._connection.write_ready.is_set():
+            await self._connection.write_ready.wait()
+        self._ping_id = (self._ping_id + 1) & self._max_id
+        data = struct.pack('!Q', self._ping_id)
+        self._h2_connection.ping(data)
+        print('>>>', data)
+        self._connection.flush()
+        fut = self._waiters[data] = self._loop.create_future()
+        try:
+            await wait_for(fut, timeout=self._timeout, loop=self._loop)
+        finally:
+            self._waiters.pop(data)
+
+    async def _coro(self):
+        while True:
+            try:
+                await self._ping()
+            except asyncio.TimeoutError:
+                print('closing')
+                self._connection._transport.close()
+                break
+            else:
+                await asyncio.sleep(self._interval)
+
+    def start(self):
+        self._task = self._loop.create_task(self._coro())
+
+    def ack(self, data):
+        print('<<<', data)
+        fut = self._waiters.get(data)
+        if fut and not fut.done():
+            fut.set_result(True)
+
+    def close(self):
+        self._task.cancel()
+
+    async def wait_closed(self):
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
 
 
 class Stream:
@@ -389,6 +448,7 @@ class EventsProcessor:
         }
 
         self.streams = {}  # type: Dict[int, Stream]
+        self.health_check = HealthCheck(self.connection)
 
     def create_stream(self):
         stream = self.connection.create_stream()
@@ -410,6 +470,7 @@ class EventsProcessor:
         self.handler.close()
         for stream in self.streams.values():
             stream.__terminated__('Connection was closed')
+        self.health_check.close()
 
     def process(self, event):
         try:
@@ -480,10 +541,10 @@ class EventsProcessor:
         self.close()
 
     def process_ping_received(self, event: PingReceived):
-        pass
+        print('---', event.ping_data)
 
     def process_ping_ack_received(self, event: PingAckReceived):
-        pass
+        self.health_check.ack(event.ping_data)
 
 
 class H2Protocol(Protocol):
@@ -508,6 +569,7 @@ class H2Protocol(Protocol):
         self.connection.flush()
 
         self.processor = EventsProcessor(self.handler, self.connection)
+        self.processor.health_check.start()
 
     def data_received(self, data: bytes):
         try:

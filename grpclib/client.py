@@ -538,6 +538,10 @@ class Channel:
             self._protocol.processor.close()
             del self._protocol
 
+    async def wait_closed(self):
+        if self._protocol is not None:
+            await self._protocol.processor.health_check.wait_closed()
+
     def __del__(self):
         if self._protocol is not None:
             message = 'Unclosed connection: {!r}'.format(self)
