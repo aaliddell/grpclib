@@ -532,6 +532,22 @@ class Stream(StreamIterator[_RecvType], Generic[_SendType, _RecvType]):
             else:
                 self._channel._calls_failed += 1
 
+    def get_extra_info(self, name: str, default: Optional[Any] = None) -> Any:
+        """Get extra info from the underlying transport
+
+        :param name: the string representing the extra information to get
+        :param default: the default value to return if unavailable
+        """
+        return self._stream._transport.get_extra_info(name, default)
+
+    def peer(self) -> Optional[Tuple[str, int]]:
+        """Get information on the connected peer
+
+        Returns a tuple containing address and port, as returned by
+        socket.getpeername(), or None on error
+        """
+        return self.get_extra_info('peername')
+
 
 class _ChannelState(enum.IntEnum):
     IDLE = 1
